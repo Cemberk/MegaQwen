@@ -271,6 +271,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+    # pybind11's type registry is keyed on the C++ type and is process-global, so
+    # two variants that share the class name collide ("already registered") once
+    # both are imported into one process. Give each hier its own class name.
+    cls_name = f"MegakernelXcdDecoder_h{hier}"
+    cpp_src = cpp_src.replace("MegakernelXcdDecoder", cls_name)
+
     kernel_dir = os.path.dirname(os.path.abspath(__file__))
     mod = load_inline(
         name=f"megakernel_batched_xcd_h{hier}",
@@ -298,7 +304,7 @@ class MegakernelXcdGenerator:
         weights = weights or load_qwen3_weights(model_name)
         kernel = _compile_xcd_kernel(hier)
 
-        self.decoder = kernel.MegakernelXcdDecoder(
+        self.decoder = getattr(kernel, f"MegakernelXcdDecoder_h{hier}")(
             weights["embed_weight"],
             weights["layer_weights"],
             weights["final_norm_weight"],
