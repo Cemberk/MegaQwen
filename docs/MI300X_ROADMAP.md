@@ -18,6 +18,28 @@ Validated TOTAL tok/s (adaptive grid auto-selects the measured optimum per batch
 | tok/s | 192 | 383 | 763 | 1455 | 2806 | 4603 | 7230 |
 | gain over device-fill | +27% | +27% | +26% | +22% | +15% | +5% | 0% |
 
+**Apples-to-apples vs vLLM (same MI300X, same 100-tok greedy workload).** vLLM
+v0.27.1 ROCm TOTAL tok/s were measured under identical conditions (task #14; vLLM
+unchanged since, so the comparison is valid). The batch-adaptive grid roughly
+*doubles* MegaQwen's share of vLLM versus the earlier Stage-1 MFMA path:
+
+| B | MegaQwen (adaptive) | vLLM v0.27.1 | MegaQwen ÷ vLLM | (was, Stage-1 MFMA) |
+|---|---|---|---|---|
+| 1  | 192  | 396   | 0.48× | 0.30× |
+| 4  | 763  | 1993  | 0.38× | 0.23× |
+| 8  | 1455 | 3443  | 0.42× | 0.25× |
+| 16 | 2806 | 6856  | 0.41× | 0.22× |
+| 32 | 4603 | 12616 | 0.36× | 0.19× |
+| 64 | 7230 | 23461 | 0.31× | 0.14× |
+
+Honest read: **vLLM's continuous batching + graph capture still leads at every
+batch size**, and the gap widens with B (barrier cost grows with the cooperative
+grid). But the single-persistent-kernel design is now within ~2–3× at serving
+batches, up from ~4–7×, entirely from launch-config topology awareness — no change
+to the per-thread math. Closing the rest is the Stage-2 hierarchical-barrier work
+(replace the flat cross-XCD `grid.sync` with intra-XCD sync + a rare cross-XCD
+reduction).
+
 **Why it works — the megakernel is barrier-bound at low batch, not bandwidth-bound.**
 Profiling the single-step kernel showed the limiter is `grid.sync()` / barrier
 serialization across the 8 XCD chiplets (~140 barriers/token), *not* HBM bandwidth,
