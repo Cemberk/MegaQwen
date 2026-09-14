@@ -1,7 +1,7 @@
 /**
- * Fused Decode with __ldg() cached reads
+ * Fused Decode with LDG() cached reads
  *
- * Strategy: Use __ldg() for read-only weight data to leverage texture cache
+ * Strategy: Use LDG() for read-only weight data to leverage texture cache
  * Based on minimal_sync but with cached loads
  */
 
@@ -42,7 +42,7 @@ struct LDGLayerWeights {
 __device__ __forceinline__ float ldg_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += __shfl_down_sync(WARP_FULL_MASK, val, offset);
     }
     return val;
 }
@@ -81,7 +81,7 @@ __device__ void ldg_matvec_qkv(
         float local_sum_sq = 0.0f;
 
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-            float v = __bfloat162float(__ldg(input + i));
+            float v = __bfloat162float(LDG(input + i));
             smem[i] = v;
             g_residual[i] = v;
             local_sum_sq += v * v;
@@ -105,7 +105,7 @@ __device__ void ldg_matvec_qkv(
         float rstd = smem_reduce[0];
 
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-            float w = __bfloat162float(__ldg(norm_weight + i));
+            float w = __bfloat162float(LDG(norm_weight + i));
             g_normalized[i] = smem[i] * rstd * w;
         }
     }
@@ -140,7 +140,7 @@ __device__ void ldg_matvec_qkv(
             float sum = 0.0f;
             #pragma unroll 8
             for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-                uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(weight_row + k));
+                uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(weight_row + k));
                 __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
                 sum += __bfloat162float(w_ptr[0]) * g_normalized[k] +
@@ -199,23 +199,23 @@ __device__ void ldg_qk_norm_rope_cache(
         }
         sum_sq = ldg_warp_reduce_sum(sum_sq);
         float scale = rsqrtf(sum_sq / float(HEAD_DIM) + LDG_RMS_EPS);
-        scale = __shfl_sync(0xffffffff, scale, 0);
+        scale = __shfl_sync(WARP_FULL_MASK, scale, 0);
 
         float q_local[HEAD_DIM / WARP_SIZE];
         #pragma unroll
         for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-            q_local[j] = q_head[i] * scale * __bfloat162float(__ldg(q_norm_weight + i));
+            q_local[j] = q_head[i] * scale * __bfloat162float(LDG(q_norm_weight + i));
         }
 
         #pragma unroll
         for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-            float cos_v = __bfloat162float(__ldg(cos_pos + i));
-            float sin_v = __bfloat162float(__ldg(sin_pos + i));
+            float cos_v = __bfloat162float(LDG(cos_pos + i));
+            float sin_v = __bfloat162float(LDG(sin_pos + i));
 
             int pair_offset = (i < HEAD_DIM/2) ? HEAD_DIM/2 : -HEAD_DIM/2;
             int pair_idx = i + pair_offset;
             int pair_j = pair_idx / WARP_SIZE;
-            float pair_v = __shfl_sync(0xffffffff, q_local[pair_j], pair_idx % WARP_SIZE);
+            float pair_v = __shfl_sync(WARP_FULL_MASK, q_local[pair_j], pair_idx % WARP_SIZE);
 
             if (i < HEAD_DIM/2) {
                 q_head[i] = q_local[j] * cos_v - pair_v * sin_v;
@@ -242,23 +242,23 @@ __device__ void ldg_qk_norm_rope_cache(
         }
         sum_sq = ldg_warp_reduce_sum(sum_sq);
         float scale = rsqrtf(sum_sq / float(HEAD_DIM) + LDG_RMS_EPS);
-        scale = __shfl_sync(0xffffffff, scale, 0);
+        scale = __shfl_sync(WARP_FULL_MASK, scale, 0);
 
         float k_local[HEAD_DIM / WARP_SIZE];
         #pragma unroll
         for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-            k_local[j] = k_head[i] * scale * __bfloat162float(__ldg(k_norm_weight + i));
+            k_local[j] = k_head[i] * scale * __bfloat162float(LDG(k_norm_weight + i));
         }
 
         #pragma unroll
         for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-            float cos_v = __bfloat162float(__ldg(cos_pos + i));
-            float sin_v = __bfloat162float(__ldg(sin_pos + i));
+            float cos_v = __bfloat162float(LDG(cos_pos + i));
+            float sin_v = __bfloat162float(LDG(sin_pos + i));
 
             int pair_offset = (i < HEAD_DIM/2) ? HEAD_DIM/2 : -HEAD_DIM/2;
             int pair_idx = i + pair_offset;
             int pair_j = pair_idx / WARP_SIZE;
-            float pair_v = __shfl_sync(0xffffffff, k_local[pair_j], pair_idx % WARP_SIZE);
+            float pair_v = __shfl_sync(WARP_FULL_MASK, k_local[pair_j], pair_idx % WARP_SIZE);
 
             float k_final;
             if (i < HEAD_DIM/2) {
@@ -289,7 +289,7 @@ __device__ void ldg_prefetch_weights_l2(
     float dummy = 0.0f;
     for (int i = threadIdx.x; i < num_elements; i += LDG_BLOCK_SIZE * 4) {
         // Read but don't use - compiler won't optimize out due to volatile-like __ldg
-        dummy += __bfloat162float(__ldg(weights + i));
+        dummy += __bfloat162float(LDG(weights + i));
     }
     // Prevent optimization (result stored to shared but never used)
     __shared__ float s_dummy;
@@ -382,10 +382,10 @@ __device__ void ldg_attention(
             // Q @ K with __ldg
             float score = 0.0f;
             for (int d = lane_id; d < HEAD_DIM; d += WARP_SIZE) {
-                score += q_head[d] * __bfloat162float(__ldg(k_pos + d));
+                score += q_head[d] * __bfloat162float(LDG(k_pos + d));
             }
             score = ldg_warp_reduce_sum(score) * attn_scale;
-            score = __shfl_sync(0xffffffff, score, 0);
+            score = __shfl_sync(WARP_FULL_MASK, score, 0);
 
             float old_max = max_score;
             max_score = fmaxf(max_score, score);
@@ -395,7 +395,7 @@ __device__ void ldg_attention(
             float weight = expf(score - max_score);
             #pragma unroll
             for (int d = lane_id, j = 0; d < HEAD_DIM; d += WARP_SIZE, j++) {
-                out_acc[j] = out_acc[j] * exp_diff + weight * __bfloat162float(__ldg(v_pos + d));
+                out_acc[j] = out_acc[j] * exp_diff + weight * __bfloat162float(LDG(v_pos + d));
             }
         }
 
@@ -484,7 +484,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
             float sum = 0.0f;
             #pragma unroll 8
             for (int k = lane_id * 4; k < Q_SIZE; k += WARP_SIZE * 4) {
-                uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(o_row + k));
+                uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(o_row + k));
                 __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
                 sum += __bfloat162float(w_ptr[0]) * attn_out[k] +
@@ -531,7 +531,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
         float rstd = smem_reduce[0];
 
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-            float w = __bfloat162float(__ldg(post_norm_weight + i));
+            float w = __bfloat162float(LDG(post_norm_weight + i));
             g_activations[i] = g_residual[i] * rstd * w;
         }
     }
@@ -554,8 +554,8 @@ __device__ void ldg_o_proj_postnorm_mlp(
 
             #pragma unroll 8
             for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-                uint2 g_u2 = __ldg(reinterpret_cast<const uint2*>(gate_row + k));
-                uint2 u_u2 = __ldg(reinterpret_cast<const uint2*>(up_row + k));
+                uint2 g_u2 = LDG(reinterpret_cast<const uint2*>(gate_row + k));
+                uint2 u_u2 = LDG(reinterpret_cast<const uint2*>(up_row + k));
                 __nv_bfloat16* g_ptr = reinterpret_cast<__nv_bfloat16*>(&g_u2);
                 __nv_bfloat16* u_ptr = reinterpret_cast<__nv_bfloat16*>(&u_u2);
 
@@ -591,7 +591,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
             float sum = 0.0f;
             #pragma unroll 8
             for (int k = lane_id * 4; k < INTERMEDIATE_SIZE; k += WARP_SIZE * 4) {
-                uint2 d_u2 = __ldg(reinterpret_cast<const uint2*>(down_row + k));
+                uint2 d_u2 = LDG(reinterpret_cast<const uint2*>(down_row + k));
                 __nv_bfloat16* d_ptr = reinterpret_cast<__nv_bfloat16*>(&d_u2);
 
                 sum += __bfloat162float(d_ptr[0]) * g_mlp_intermediate[k] +
@@ -646,7 +646,7 @@ ldg_decode_kernel(
     // Embedding lookup with __ldg
     const __nv_bfloat16* embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
     for (int i = block_id * LDG_BLOCK_SIZE + threadIdx.x; i < HIDDEN_SIZE; i += num_blocks * LDG_BLOCK_SIZE) {
-        hidden_buffer[i] = __ldg(embed_row + i);
+        hidden_buffer[i] = LDG(embed_row + i);
     }
     grid.sync();
 
@@ -716,7 +716,7 @@ ldg_decode_kernel(
         float rstd = smem_reduce[0];
 
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-            float wt = __bfloat162float(__ldg(final_norm_weight + i));
+            float wt = __bfloat162float(LDG(final_norm_weight + i));
             g_normalized[i] = g_activations[i] * rstd * wt;
         }
     }
@@ -752,7 +752,7 @@ __global__ void ldg_lm_head_logits(
         float sum = 0.0f;
         #pragma unroll 8
         for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-            uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(w_row + k));
+            uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(w_row + k));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
             sum += __bfloat162float(w_ptr[0]) * s_hidden[k] +
@@ -797,7 +797,7 @@ __global__ void ldg_lm_head_phase1(
         float sum = 0.0f;
         #pragma unroll 8
         for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-            uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(w_row + k));
+            uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(w_row + k));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
             sum += __bfloat162float(w_ptr[0]) * s_hidden[k] +
@@ -813,8 +813,8 @@ __global__ void ldg_lm_head_phase1(
         }
     }
 
-    local_max = __shfl_sync(0xffffffff, local_max, 0);
-    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+    local_max = __shfl_sync(WARP_FULL_MASK, local_max, 0);
+    local_max_idx = __shfl_sync(WARP_FULL_MASK, local_max_idx, 0);
 
     __shared__ float warp_max[LDG_LM_BLOCK_SIZE / WARP_SIZE];
     __shared__ int warp_idx[LDG_LM_BLOCK_SIZE / WARP_SIZE];
@@ -830,8 +830,8 @@ __global__ void ldg_lm_head_phase1(
         int max_idx = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
 
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
-            int other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            float other_val = __shfl_down_sync(WARP_FULL_MASK, max_val, offset);
+            int other_idx = __shfl_down_sync(WARP_FULL_MASK, max_idx, offset);
             if (other_val > max_val) {
                 max_val = other_val;
                 max_idx = other_idx;
@@ -944,9 +944,14 @@ extern "C" void launch_ldg_decode(
         (void*)&attn_scale
     };
 
+    // Fill the actual device (MI300X: 304 CUs) instead of a hardcoded 82 (3090
+    // SM count). Cooperative grid must be co-resident; computed once (occupancy
+    // query is a host call — keep it off the per-token decode critical path).
+    static int ldg_grid_blocks =
+        mq_coop_grid_blocks((void*)ldg_decode_kernel, LDG_BLOCK_SIZE, 0);
     cudaLaunchCooperativeKernel(
         (void*)ldg_decode_kernel,
-        dim3(LDG_NUM_BLOCKS),
+        dim3(ldg_grid_blocks),
         dim3(LDG_BLOCK_SIZE),
         kernel_args,
         0,
@@ -1024,9 +1029,14 @@ extern "C" void launch_ldg_decode_with_logits(
         (void*)&attn_scale
     };
 
+    // Fill the actual device (MI300X: 304 CUs) instead of a hardcoded 82 (3090
+    // SM count). Cooperative grid must be co-resident; computed once (occupancy
+    // query is a host call — keep it off the per-token decode critical path).
+    static int ldg_grid_blocks =
+        mq_coop_grid_blocks((void*)ldg_decode_kernel, LDG_BLOCK_SIZE, 0);
     cudaLaunchCooperativeKernel(
         (void*)ldg_decode_kernel,
-        dim3(LDG_NUM_BLOCKS),
+        dim3(ldg_grid_blocks),
         dim3(LDG_BLOCK_SIZE),
         kernel_args,
         0,

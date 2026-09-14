@@ -6,6 +6,8 @@ import torch
 from torch.utils.cpp_extension import load_inline
 from transformers import AutoTokenizer
 
+from build_flags import cuda_cflags  # CUDA/ROCm-aware extra_cuda_cflags
+
 # Model config
 NUM_LAYERS = 28
 HIDDEN_SIZE = 1024
@@ -328,15 +330,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         name=f"ldg_kernel_chat_{safe_variant}",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++17",
-            "--expt-relaxed-constexpr",
-            "-I" + kernel_dir,
-            "-lineinfo",
-            "-maxrregcount=64",
-        ],
+        extra_cuda_cflags=cuda_cflags(
+            include_dirs=[kernel_dir],
+            nvcc_extra=["-lineinfo", "-maxrregcount=64"],
+        ),
         verbose=False,
     )
 

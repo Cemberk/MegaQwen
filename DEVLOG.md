@@ -494,3 +494,46 @@ The megakernel approach remains valuable for short-context, single-user, low-lat
 ---
 
 *Last updated: February 2026*
+
+---
+
+## ROCm / MI300X port (Phase 1)
+
+Ported the single-GPU path to AMD Instinct MI300X (gfx942, ROCm 7.x) for an
+apples-to-apples number on the chart. Correctness milestone, not a tuned result.
+
+**What the port touches**
+- `csrc/megakernel/port.cuh` (new) — platform shim. Compile-time `WARP_SIZE`
+  (32 NVIDIA / 64 AMD) so every `WARP_SIZE`-relative construct (reduction trees,
+  `NUM_WARPS`, per-lane register arrays `HEAD_DIM/WARP_SIZE`, attention
+  lane-pairing) recompiles for a 64-wide wavefront with no call-site churn;
+  `mq_async_*` async-copy shim; `mq_coop_grid_blocks()` device-query grid sizing.
+- `config.cuh` — includes the shim, drops the local `WARP_SIZE=32`, guards the
+  cp.async PTX helpers (invalid asm fails to compile on the AMD backend even when
+  unused).
+- Decode (`fused_decode_ldg.cu`) and fused prefill (`fused_prefill_megakernel.cu`)
+  — cooperative launches now fill the device (304 CUs) instead of a hardcoded 82
+  (3090 SM count). Both kernels are grid-stride so co-residency holds.
+- `build_flags.py` (new) — one helper emitting hipcc-correct flags
+  (`--offload-arch=gfx942 -ffast-math -DUSE_ROCM`, dropping nvcc-only
+  `--use_fast_math`/`--expt-relaxed-constexpr`/`-lineinfo`/`-maxrregcount`/`-arch`)
+  and `-lcublas`->`-lhipblas` link mapping. Wired into every active loader.
+- `verify_correctness.py` — rewritten from a print-only no-op into a real gate
+  that hard-asserts greedy-token agreement with HuggingFace for BOTH the decode
+  and fused-prefill paths (plus `tests/test_parity.py`, GPU-gated).
+
+**Key differences from the NVIDIA build**
+- **Wavefront 64** is the main correctness surface; the parity gate is the guardrail.
+- **`__ldg` texture-cache thesis does not transfer** to CDNA3 — the RTX 3090 win
+  came from the read-only texture path; expect a different perf profile on MI300X.
+- **cp.async** has no clean CDNA3 equivalent: AMD uses a synchronous 128-bit copy
+  fallback for now (`global_load_lds` is the perf follow-up). The default decode
+  kernel avoids cp.async entirely.
+- **Prefill without hipBLAS**: the fused prefill megakernel is BLAS-free and is the
+  recommended MI300X prefill; the cuBLAS path links via hipBLAS for long prompts
+  but its bf16 GEMM numerics need on-device validation.
+- The **grid.sync ~530 tok/s ceiling** was specific to the 3090's 82 SMs and must
+  be re-measured on 304 CUs.
+
+Run it: `bash scripts/rocm/build_and_verify.sh` (see `scripts/rocm/README.md`).
+

@@ -45,7 +45,7 @@ struct LDGV2LayerWeights {
 __device__ __forceinline__ float ldg_v2_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += __shfl_down_sync(WARP_FULL_MASK, val, offset);
     }
     return val;
 }
@@ -87,7 +87,7 @@ __device__ void ldg_v2_matvec_qkv(
         // HIDDEN_SIZE=1024, 1024/8=128 uint4 loads total
         // 256 threads, each does 128/256 < 1, so we need stride-based loading
         for (int i = threadIdx.x * 8; i < HIDDEN_SIZE; i += LDG_V2_BLOCK_SIZE * 8) {
-            uint4 in_u4 = __ldg(reinterpret_cast<const uint4*>(input + i));
+            uint4 in_u4 = LDG(reinterpret_cast<const uint4*>(input + i));
             __nv_bfloat16* in_ptr = reinterpret_cast<__nv_bfloat16*>(&in_u4);
 
             #pragma unroll
@@ -118,7 +118,7 @@ __device__ void ldg_v2_matvec_qkv(
 
         // Vectorized output with uint4 loads for norm_weight
         for (int i = threadIdx.x * 8; i < HIDDEN_SIZE; i += LDG_V2_BLOCK_SIZE * 8) {
-            uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(norm_weight + i));
+            uint4 w_u4 = LDG(reinterpret_cast<const uint4*>(norm_weight + i));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
 
             // Store as float4 pairs for better coalescing
@@ -170,7 +170,7 @@ __device__ void ldg_v2_matvec_qkv(
             #pragma unroll 4
             for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
                 // 128-bit weight load
-                uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(weight_row + k));
+                uint4 w_u4 = LDG(reinterpret_cast<const uint4*>(weight_row + k));
                 __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
 
                 // 128-bit activation loads (2 x float4)
@@ -239,10 +239,10 @@ __device__ void ldg_v2_qk_norm_rope_cache(
 
         sum_sq = ldg_v2_warp_reduce_sum(sum_sq);
         float scale = rsqrtf(sum_sq / float(HEAD_DIM) + LDG_V2_RMS_EPS);
-        scale = __shfl_sync(0xffffffff, scale, 0);
+        scale = __shfl_sync(WARP_FULL_MASK, scale, 0);
 
         // Load norm weight with uint2 (4 bf16 = 64 bits matches float4 for q)
-        uint2 qn_u2 = __ldg(reinterpret_cast<const uint2*>(q_norm_weight + lane_id * 4));
+        uint2 qn_u2 = LDG(reinterpret_cast<const uint2*>(q_norm_weight + lane_id * 4));
         __nv_bfloat16* qn_ptr = reinterpret_cast<__nv_bfloat16*>(&qn_u2);
 
         // Apply norm
@@ -253,8 +253,8 @@ __device__ void ldg_v2_qk_norm_rope_cache(
         q_local[3] = q_local4.w * scale * __bfloat162float(qn_ptr[3]);
 
         // Load cos/sin with uint2
-        uint2 cos_u2 = __ldg(reinterpret_cast<const uint2*>(cos_pos + lane_id * 4));
-        uint2 sin_u2 = __ldg(reinterpret_cast<const uint2*>(sin_pos + lane_id * 4));
+        uint2 cos_u2 = LDG(reinterpret_cast<const uint2*>(cos_pos + lane_id * 4));
+        uint2 sin_u2 = LDG(reinterpret_cast<const uint2*>(sin_pos + lane_id * 4));
         __nv_bfloat16* cos_ptr = reinterpret_cast<__nv_bfloat16*>(&cos_u2);
         __nv_bfloat16* sin_ptr = reinterpret_cast<__nv_bfloat16*>(&sin_u2);
 
@@ -273,7 +273,7 @@ __device__ void ldg_v2_qk_norm_rope_cache(
             int pair_lane = pair_idx / 4;
             int pair_j = pair_idx % 4;
 
-            float pair_v = __shfl_sync(0xffffffff, q_local[pair_j], pair_lane);
+            float pair_v = __shfl_sync(WARP_FULL_MASK, q_local[pair_j], pair_lane);
 
             float result;
             if (i < HEAD_DIM/2) {
@@ -313,10 +313,10 @@ __device__ void ldg_v2_qk_norm_rope_cache(
 
         sum_sq = ldg_v2_warp_reduce_sum(sum_sq);
         float scale = rsqrtf(sum_sq / float(HEAD_DIM) + LDG_V2_RMS_EPS);
-        scale = __shfl_sync(0xffffffff, scale, 0);
+        scale = __shfl_sync(WARP_FULL_MASK, scale, 0);
 
         // Load norm weight
-        uint2 kn_u2 = __ldg(reinterpret_cast<const uint2*>(k_norm_weight + lane_id * 4));
+        uint2 kn_u2 = LDG(reinterpret_cast<const uint2*>(k_norm_weight + lane_id * 4));
         __nv_bfloat16* kn_ptr = reinterpret_cast<__nv_bfloat16*>(&kn_u2);
 
         float k_local[4];
@@ -326,8 +326,8 @@ __device__ void ldg_v2_qk_norm_rope_cache(
         k_local[3] = k_local4.w * scale * __bfloat162float(kn_ptr[3]);
 
         // Load cos/sin
-        uint2 cos_u2 = __ldg(reinterpret_cast<const uint2*>(cos_pos + lane_id * 4));
-        uint2 sin_u2 = __ldg(reinterpret_cast<const uint2*>(sin_pos + lane_id * 4));
+        uint2 cos_u2 = LDG(reinterpret_cast<const uint2*>(cos_pos + lane_id * 4));
+        uint2 sin_u2 = LDG(reinterpret_cast<const uint2*>(sin_pos + lane_id * 4));
         __nv_bfloat16* cos_ptr = reinterpret_cast<__nv_bfloat16*>(&cos_u2);
         __nv_bfloat16* sin_ptr = reinterpret_cast<__nv_bfloat16*>(&sin_u2);
 
@@ -346,7 +346,7 @@ __device__ void ldg_v2_qk_norm_rope_cache(
             int pair_lane = pair_idx / 4;
             int pair_j = pair_idx % 4;
 
-            float pair_v = __shfl_sync(0xffffffff, k_local[pair_j], pair_lane);
+            float pair_v = __shfl_sync(WARP_FULL_MASK, k_local[pair_j], pair_lane);
 
             float k_final;
             if (i < HEAD_DIM/2) {
@@ -419,7 +419,7 @@ __device__ void ldg_v2_attention(
             int elems_per_block = (Q_SIZE * HIDDEN_SIZE) / (num_prefetch_blocks / 3 + 1);
             int start = prefetch_block_id * elems_per_block;
             for (int i = threadIdx.x; i < elems_per_block; i += LDG_V2_BLOCK_SIZE * 4) {
-                dummy += __bfloat162float(__ldg(o_weight + start + i));
+                dummy += __bfloat162float(LDG(o_weight + start + i));
             }
         }
         else if (prefetch_block_id < 2 * num_prefetch_blocks / 3) {
@@ -427,7 +427,7 @@ __device__ void ldg_v2_attention(
             int elems_per_block = (HIDDEN_SIZE * INTERMEDIATE_SIZE) / (num_prefetch_blocks / 3 + 1);
             int start = adjusted_id * elems_per_block;
             for (int i = threadIdx.x; i < elems_per_block; i += LDG_V2_BLOCK_SIZE * 4) {
-                dummy += __bfloat162float(__ldg(gate_weight + start + i));
+                dummy += __bfloat162float(LDG(gate_weight + start + i));
             }
         }
         else {
@@ -435,7 +435,7 @@ __device__ void ldg_v2_attention(
             int elems_per_block = (HIDDEN_SIZE * INTERMEDIATE_SIZE) / (num_prefetch_blocks / 3 + 1);
             int start = adjusted_id * elems_per_block;
             for (int i = threadIdx.x; i < elems_per_block; i += LDG_V2_BLOCK_SIZE * 4) {
-                dummy += __bfloat162float(__ldg(up_weight + start + i));
+                dummy += __bfloat162float(LDG(up_weight + start + i));
             }
         }
         __shared__ float s_dummy;
@@ -470,7 +470,7 @@ __device__ void ldg_v2_attention(
             const __nv_bfloat16* v_pos = v_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
 
             // Use uint2 for K cache (4 bf16 elements matches lane's q_local)
-            uint2 k_u2 = __ldg(reinterpret_cast<const uint2*>(k_pos + lane_id * 4));
+            uint2 k_u2 = LDG(reinterpret_cast<const uint2*>(k_pos + lane_id * 4));
             __nv_bfloat16* k_ptr = reinterpret_cast<__nv_bfloat16*>(&k_u2);
 
             float score = q_local.x * __bfloat162float(k_ptr[0]) +
@@ -479,7 +479,7 @@ __device__ void ldg_v2_attention(
                           q_local.w * __bfloat162float(k_ptr[3]);
 
             score = ldg_v2_warp_reduce_sum(score) * attn_scale;
-            score = __shfl_sync(0xffffffff, score, 0);
+            score = __shfl_sync(WARP_FULL_MASK, score, 0);
 
             float old_max = max_score;
             max_score = fmaxf(max_score, score);
@@ -489,7 +489,7 @@ __device__ void ldg_v2_attention(
             float weight = expf(score - max_score);
 
             // Load V with uint2
-            uint2 v_u2 = __ldg(reinterpret_cast<const uint2*>(v_pos + lane_id * 4));
+            uint2 v_u2 = LDG(reinterpret_cast<const uint2*>(v_pos + lane_id * 4));
             __nv_bfloat16* v_ptr = reinterpret_cast<__nv_bfloat16*>(&v_u2);
 
             out_acc[0] = out_acc[0] * exp_diff + weight * __bfloat162float(v_ptr[0]);
@@ -582,7 +582,7 @@ __device__ void ldg_v2_o_proj_postnorm_mlp(
             float sum = 0.0f;
             #pragma unroll 4
             for (int k = lane_id * 8; k < Q_SIZE; k += WARP_SIZE * 8) {
-                uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(o_row + k));
+                uint4 w_u4 = LDG(reinterpret_cast<const uint4*>(o_row + k));
                 __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
 
                 float4 a1 = *reinterpret_cast<const float4*>(attn_out + k);
@@ -636,7 +636,7 @@ __device__ void ldg_v2_o_proj_postnorm_mlp(
         float rstd = smem_reduce[0];
 
         for (int i = threadIdx.x * 8; i < HIDDEN_SIZE; i += LDG_V2_BLOCK_SIZE * 8) {
-            uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(post_norm_weight + i));
+            uint4 w_u4 = LDG(reinterpret_cast<const uint4*>(post_norm_weight + i));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
 
             float4 r1 = *reinterpret_cast<const float4*>(g_residual + i);
@@ -675,8 +675,8 @@ __device__ void ldg_v2_o_proj_postnorm_mlp(
 
             #pragma unroll 4
             for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
-                uint4 g_u4 = __ldg(reinterpret_cast<const uint4*>(gate_row + k));
-                uint4 u_u4 = __ldg(reinterpret_cast<const uint4*>(up_row + k));
+                uint4 g_u4 = LDG(reinterpret_cast<const uint4*>(gate_row + k));
+                uint4 u_u4 = LDG(reinterpret_cast<const uint4*>(up_row + k));
                 __nv_bfloat16* g_ptr = reinterpret_cast<__nv_bfloat16*>(&g_u4);
                 __nv_bfloat16* u_ptr = reinterpret_cast<__nv_bfloat16*>(&u_u4);
 
@@ -723,7 +723,7 @@ __device__ void ldg_v2_o_proj_postnorm_mlp(
             float sum = 0.0f;
             #pragma unroll 4
             for (int k = lane_id * 8; k < INTERMEDIATE_SIZE; k += WARP_SIZE * 8) {
-                uint4 d_u4 = __ldg(reinterpret_cast<const uint4*>(down_row + k));
+                uint4 d_u4 = LDG(reinterpret_cast<const uint4*>(down_row + k));
                 __nv_bfloat16* d_ptr = reinterpret_cast<__nv_bfloat16*>(&d_u4);
 
                 float4 m1 = *reinterpret_cast<const float4*>(g_mlp_intermediate + k);
@@ -785,7 +785,7 @@ ldg_v2_decode_kernel(
     // Embedding lookup with uint4 (128-bit) loads
     const __nv_bfloat16* embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
     for (int i = block_id * LDG_V2_BLOCK_SIZE * 8 + threadIdx.x * 8; i < HIDDEN_SIZE; i += num_blocks * LDG_V2_BLOCK_SIZE * 8) {
-        uint4 e_u4 = __ldg(reinterpret_cast<const uint4*>(embed_row + i));
+        uint4 e_u4 = LDG(reinterpret_cast<const uint4*>(embed_row + i));
         *reinterpret_cast<uint4*>(hidden_buffer + i) = e_u4;
     }
     grid.sync();
@@ -862,7 +862,7 @@ ldg_v2_decode_kernel(
         float rstd = smem_reduce[0];
 
         for (int i = threadIdx.x * 8; i < HIDDEN_SIZE; i += LDG_V2_BLOCK_SIZE * 8) {
-            uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(final_norm_weight + i));
+            uint4 w_u4 = LDG(reinterpret_cast<const uint4*>(final_norm_weight + i));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
 
             float4 out1, out2;
@@ -919,7 +919,7 @@ __global__ void ldg_v2_lm_head_phase1(
         float sum = 0.0f;
         #pragma unroll 4
         for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
-            uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(w_row + k));
+            uint4 w_u4 = LDG(reinterpret_cast<const uint4*>(w_row + k));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u4);
 
             sum += __bfloat162float(w_ptr[0]) * s_hidden[k + 0] +
@@ -939,8 +939,8 @@ __global__ void ldg_v2_lm_head_phase1(
         }
     }
 
-    local_max = __shfl_sync(0xffffffff, local_max, 0);
-    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+    local_max = __shfl_sync(WARP_FULL_MASK, local_max, 0);
+    local_max_idx = __shfl_sync(WARP_FULL_MASK, local_max_idx, 0);
 
     __shared__ float warp_max[LDG_V2_LM_BLOCK_SIZE / WARP_SIZE];
     __shared__ int warp_idx[LDG_V2_LM_BLOCK_SIZE / WARP_SIZE];
@@ -956,8 +956,8 @@ __global__ void ldg_v2_lm_head_phase1(
         int max_idx = (lane_id < LDG_V2_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
 
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
-            int other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            float other_val = __shfl_down_sync(WARP_FULL_MASK, max_val, offset);
+            int other_idx = __shfl_down_sync(WARP_FULL_MASK, max_idx, offset);
             if (other_val > max_val) {
                 max_val = other_val;
                 max_idx = other_idx;

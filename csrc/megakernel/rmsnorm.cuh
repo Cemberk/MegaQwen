@@ -213,7 +213,7 @@ __device__ __forceinline__ void rmsnorm_per_head_parallel(
             float variance = sum_sq / float(head_dim);
             rstd = rsqrtf(variance + eps);
         }
-        rstd = __shfl_sync(0xffffffff, rstd, 0);
+        rstd = __shfl_sync(WARP_FULL_MASK, rstd, 0);
 
         // Apply normalization
         #pragma unroll

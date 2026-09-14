@@ -55,6 +55,10 @@ constexpr int XCD_Q_COLS    = XCD_Q_HEADS * HEAD_DIM;          // 256 (attn_out 
 constexpr int XCD_INT       = INTERMEDIATE_SIZE / MQ_NXCD;     // 384
 
 struct MFMALayerWeights {
+    // In the fp8 build (MQ_FP8_WEIGHTS=1) the 7 projection slots hold fp8
+    // (e4m3fnuz) weight pointers instead of bf16; norms stay bf16. The 7 per-
+    // output-channel f32 dequant scales are appended so the struct layout matches
+    // the host-side copy exactly for both builds.
     const __nv_bfloat16* input_layernorm_weight;
     const __nv_bfloat16* q_proj_weight;
     const __nv_bfloat16* k_proj_weight;
@@ -66,9 +70,19 @@ struct MFMALayerWeights {
     const __nv_bfloat16* gate_proj_weight;
     const __nv_bfloat16* up_proj_weight;
     const __nv_bfloat16* down_proj_weight;
+#if MQ_FP8_WEIGHTS
+    const float* q_proj_scale;
+    const float* k_proj_scale;
+    const float* v_proj_scale;
+    const float* o_proj_scale;
+    const float* gate_proj_scale;
+    const float* up_proj_scale;
+    const float* down_proj_scale;
+#endif
 };
 
-#define BF(p) reinterpret_cast<const __bf16*>(p)
+#define BF(p)  reinterpret_cast<const __bf16*>(p)
+#define FP8(p) reinterpret_cast<const mq_fp8*>(p)
 
 // =============================================================================
 // Small helpers (shared with Stage 1)
@@ -140,6 +154,44 @@ __device__ __forceinline__ void gemm_xcd_partial(
         mq_mfma_tile_store<float>(Cpart, out_dim, mi * 16, ni * 16, acc);
     }
 }
+
+#if MQ_FP8_WEIGHTS
+// fp8 weight-only counterparts of gemm_xcd_out / gemm_xcd_partial: identical
+// tiling, but W is fp8 (converted to bf16 in-register) and the per-output-channel
+// dequant scale is folded into the store. A (activations) stays bf16.
+template <typename Tout>
+__device__ __forceinline__ void gemm_xcd_out_fp8(
+    const __bf16* __restrict__ A, const mq_fp8* __restrict__ W, const float* __restrict__ scale,
+    Tout* __restrict__ C, int Mpad, int in_dim, int out_dim, int col0, int col_len, int xcd) {
+    int lwarp = mfma_lbid(xcd) * MFMA_NUM_WARPS + (threadIdx.x / WARP_SIZE);
+    int nlw   = mfma_lnb(xcd) * MFMA_NUM_WARPS;
+    int nt    = col_len / 16;
+    int ntiles = (Mpad / 16) * nt;
+    for (int t = lwarp; t < ntiles; t += nlw) {
+        int mi = t / nt, ni = t % nt;
+        mq_f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+        mq_mfma_tile_accum_fp8(A, W, in_dim, mi * 16, col0 + ni * 16, acc);
+        mq_mfma_tile_store_scaled<Tout>(C, scale, out_dim, mi * 16, col0 + ni * 16, acc);
+    }
+}
+
+__device__ __forceinline__ void gemm_xcd_partial_fp8(
+    const __bf16* __restrict__ A, const mq_fp8* __restrict__ W, const float* __restrict__ scale,
+    float* __restrict__ Cpart, int Mpad, int in_dim, int out_dim, int k0, int k_len, int xcd) {
+    int lwarp = mfma_lbid(xcd) * MFMA_NUM_WARPS + (threadIdx.x / WARP_SIZE);
+    int nlw   = mfma_lnb(xcd) * MFMA_NUM_WARPS;
+    int nt    = out_dim / 16;
+    int ntiles = (Mpad / 16) * nt;
+    for (int t = lwarp; t < ntiles; t += nlw) {
+        int mi = t / nt, ni = t % nt;
+        mq_f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+        mq_mfma_tile_accum_krange_fp8(A, W, in_dim, k0, k0 + k_len, mi * 16, ni * 16, acc);
+        // Scale factors out of the K-sum, so applying it to each per-XCD partial is
+        // exact: allreduce sums s[n]*partial_xcd = s[n]*full.
+        mq_mfma_tile_store_scaled<float>(Cpart, scale, out_dim, mi * 16, ni * 16, acc);
+    }
+}
+#endif  // MQ_FP8_WEIGHTS
 
 // All-reduce the X per-XCD partials (+ residual) into this XCD's output replica.
 // partials: [X, Mpad, dim]; resid_rep/out_rep: [X, Mpad, dim]. Local threads.
@@ -429,12 +481,21 @@ mfma_xcd_decode_kernel(
         MQ_LOCAL_BARRIER();
 
         // 2) QKV expand (output-sharded): this XCD writes its Q/KV column slices
+#if MQ_FP8_WEIGHTS
+        gemm_xcd_out_fp8<float>(norm_rep, FP8(w.q_proj_weight), w.q_proj_scale, g_q, Mpad, HIDDEN_SIZE, Q_SIZE,
+                                xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+        gemm_xcd_out_fp8<float>(norm_rep, FP8(w.k_proj_weight), w.k_proj_scale, g_k, Mpad, HIDDEN_SIZE, KV_SIZE,
+                                xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+        gemm_xcd_out_fp8<float>(norm_rep, FP8(w.v_proj_weight), w.v_proj_scale, g_v, Mpad, HIDDEN_SIZE, KV_SIZE,
+                                xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+#else
         gemm_xcd_out<float>(norm_rep, BF(w.q_proj_weight), g_q, Mpad, HIDDEN_SIZE, Q_SIZE,
                             xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
         gemm_xcd_out<float>(norm_rep, BF(w.k_proj_weight), g_k, Mpad, HIDDEN_SIZE, KV_SIZE,
                             xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
         gemm_xcd_out<float>(norm_rep, BF(w.v_proj_weight), g_v, Mpad, HIDDEN_SIZE, KV_SIZE,
                             xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+#endif
         MQ_LOCAL_BARRIER();
 
         // 3) QK-norm + RoPE + KV cache (own heads)
@@ -449,8 +510,13 @@ mfma_xcd_decode_kernel(
         MQ_LOCAL_BARRIER();
 
         // 5) O-proj CONTRACT (K-sharded) -> per-XCD partial
+#if MQ_FP8_WEIGHTS
+        gemm_xcd_partial_fp8(BF(g_attn_out), FP8(w.o_proj_weight), w.o_proj_scale, g_partial + (size_t)xcd * rep,
+                             Mpad, Q_SIZE, HIDDEN_SIZE, xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+#else
         gemm_xcd_partial(BF(g_attn_out), BF(w.o_proj_weight), g_partial + (size_t)xcd * rep,
                          Mpad, Q_SIZE, HIDDEN_SIZE, xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+#endif
         grid.sync();  // CROSS-XCD: publish all O-proj partials
 
         // 6) all-reduce partials + pre-attn residual -> g_activations replica
@@ -462,10 +528,17 @@ mfma_xcd_decode_kernel(
         MQ_LOCAL_BARRIER();
 
         // 8) gate + up expand (output-sharded): this XCD's intermediate slice
+#if MQ_FP8_WEIGHTS
+        gemm_xcd_out_fp8<float>(norm_rep, FP8(w.gate_proj_weight), w.gate_proj_scale, g_gate, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                xcd * XCD_INT, XCD_INT, xcd);
+        gemm_xcd_out_fp8<float>(norm_rep, FP8(w.up_proj_weight), w.up_proj_scale, g_up, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                xcd * XCD_INT, XCD_INT, xcd);
+#else
         gemm_xcd_out<float>(norm_rep, BF(w.gate_proj_weight), g_gate, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
                             xcd * XCD_INT, XCD_INT, xcd);
         gemm_xcd_out<float>(norm_rep, BF(w.up_proj_weight), g_up, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
                             xcd * XCD_INT, XCD_INT, xcd);
+#endif
         MQ_LOCAL_BARRIER();
 
         // 9) SiLU(gate)*up (own slice)
@@ -473,8 +546,13 @@ mfma_xcd_decode_kernel(
         MQ_LOCAL_BARRIER();
 
         // 10) down-proj CONTRACT (K-sharded) -> per-XCD partial
+#if MQ_FP8_WEIGHTS
+        gemm_xcd_partial_fp8(BF(g_mlp), FP8(w.down_proj_weight), w.down_proj_scale, g_partial + (size_t)xcd * rep,
+                             Mpad, INTERMEDIATE_SIZE, HIDDEN_SIZE, xcd * XCD_INT, XCD_INT, xcd);
+#else
         gemm_xcd_partial(BF(g_mlp), BF(w.down_proj_weight), g_partial + (size_t)xcd * rep,
                          Mpad, INTERMEDIATE_SIZE, HIDDEN_SIZE, xcd * XCD_INT, XCD_INT, xcd);
+#endif
         grid.sync();  // CROSS-XCD: publish all down-proj partials
 
         // 11) all-reduce partials + post-attn residual -> hidden replica
@@ -526,8 +604,232 @@ __global__ void mfma_xcd_lm_head_argmax(
 }
 
 // =============================================================================
+// In-kernel multi-token decode (per-token overhead lever).
+//
+// The single-step path launches 3 kernels per token (coop transformer + LM GEMM +
+// argmax) and round-trips to the host between tokens (.tolist() D2H sync, next-
+// token tensor build, cooperative relaunch of the device-filling grid). At B=1
+// that overhead is ~97% of the ~6.9 ms/token wall clock (memory-bound floor is
+// ~230 us). mfma_xcd_decode_multi folds the LM head INTO the cooperative kernel
+// and loops `num_steps` decode steps on-device: argmax feeds the next embedding
+// through a device cur_tokens[B] buffer, position/cache_len advance per step, and
+// the whole generation phase is ONE launch with zero host round trips. Greedy
+// argmax is deterministic, so the emitted [num_steps,B] tokens are bit-identical
+// to the single-step loop (EOS truncation, if any, is a host post-step).
+// =============================================================================
+
+// LM head GEMM over the WHOLE cooperative grid (not per-XCD): logits[Mpad,vocab]
+// = A[Mpad,in] @ W[vocab,in]^T. Distributes tiles over gridDim.x*MFMA_NUM_WARPS.
+__device__ __forceinline__ void lm_head_gemm_grid(
+    const __bf16* __restrict__ A, const __bf16* __restrict__ W,
+    float* __restrict__ logits, int Mpad, int in_dim, int out_dim) {
+    int gwarp = blockIdx.x * MFMA_NUM_WARPS + (threadIdx.x / WARP_SIZE);
+    int nwarp = gridDim.x * MFMA_NUM_WARPS;
+    int nt    = out_dim / 16;
+    int ntiles = (Mpad / 16) * nt;
+    for (int t = gwarp; t < ntiles; t += nwarp) {
+        int mi = t / nt, ni = t % nt;
+        mq_f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+        mq_mfma_tile_accum(A, W, in_dim, mi * 16, ni * 16, acc);
+        mq_mfma_tile_store<float>(logits, out_dim, mi * 16, ni * 16, acc);
+    }
+}
+
+// Per-row argmax over the grid: block b (b < B) scans the full vocab and writes
+// the greedy token to cur_tokens[b] (next-step feedback) and out_step[b] (output).
+// Strict '>' + tree reduction that keeps the smaller thread id on ties selects the
+// smallest index of the max — same tie-break as mfma_xcd_lm_head_argmax, so the
+// 256-thread block here is greedy-identical to the 1024-thread single-step kernel.
+__device__ __forceinline__ void lm_argmax_grid(
+    const float* __restrict__ logits, int* __restrict__ cur_tokens,
+    int* __restrict__ out_step, int B, int vocab) {
+    __shared__ float sv[MFMA_BLOCK_SIZE];
+    __shared__ int   si[MFMA_BLOCK_SIZE];
+    int tid = threadIdx.x;
+    for (int b = blockIdx.x; b < B; b += gridDim.x) {
+        const float* row = logits + (size_t)b * vocab;
+        float mx = -INFINITY; int mi = -1;
+        for (int i = tid; i < vocab; i += blockDim.x) { float v = row[i]; if (v > mx) { mx = v; mi = i; } }
+        sv[tid] = mx; si[tid] = mi;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s && sv[tid + s] > sv[tid]) { sv[tid] = sv[tid + s]; si[tid] = si[tid + s]; }
+            __syncthreads();
+        }
+        if (tid == 0) { cur_tokens[b] = si[0]; out_step[b] = si[0]; }
+        __syncthreads();  // reuse sv/si next b iteration
+    }
+}
+
+__global__ void __launch_bounds__(MFMA_BLOCK_SIZE, 1)
+mfma_xcd_decode_multi_kernel(
+    const int* __restrict__ input_tokens,          // [B] seed (last prompt token)
+    int* __restrict__ cur_tokens,                  // [B] device feedback scratch
+    int* __restrict__ output_tokens,               // [num_steps, B] emitted tokens
+    const __nv_bfloat16* __restrict__ embed_weight,
+    const MFMALayerWeights* __restrict__ layer_weights,
+    const __nv_bfloat16* __restrict__ final_norm_weight,
+    const __nv_bfloat16* __restrict__ lm_head_weight,
+    const __nv_bfloat16* __restrict__ cos_table,
+    const __nv_bfloat16* __restrict__ sin_table,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ hidden,
+    __nv_bfloat16* __restrict__ g_normalized,
+    float* __restrict__ g_residual,
+    float* __restrict__ g_q,
+    float* __restrict__ g_k,
+    float* __restrict__ g_v,
+    __nv_bfloat16* __restrict__ g_attn_out,
+    float* __restrict__ g_activations,
+    float* __restrict__ g_partial,
+    float* __restrict__ g_gate,
+    float* __restrict__ g_up,
+    __nv_bfloat16* __restrict__ g_mlp,
+    float* __restrict__ lm_logits,
+    int* __restrict__ bar_arrive,
+    int* __restrict__ bar_sense,
+    const int* __restrict__ nb_xcd,
+    int B, int Mpad, int num_layers,
+    int base_position, int base_cache_len, int max_seq_len, float attn_scale,
+    int num_steps) {
+    cg::grid_group grid = cg::this_grid();
+    int xcd = blockIdx.x % MQ_NXCD;
+    MqXcdBar bar{bar_arrive, bar_sense, nb_xcd};
+    bool my_sense = false;
+
+#if MQ_XCD_HIER
+    #define MQ_LOCAL_BARRIER() mq_xcd_bar(bar, xcd, my_sense)
+#else
+    #define MQ_LOCAL_BARRIER() do { (void)bar; (void)my_sense; grid.sync(); } while (0)
+#endif
+
+    size_t rep = (size_t)Mpad * HIDDEN_SIZE;
+
+    // Seed the feedback buffer once from the input tokens.
+    {
+        int gt = blockIdx.x * blockDim.x + threadIdx.x;
+        for (int b = gt; b < B; b += gridDim.x * blockDim.x) cur_tokens[b] = input_tokens[b];
+    }
+    grid.sync();
+
+    for (int step = 0; step < num_steps; step++) {
+        int position  = base_position + step;
+        int cache_len = base_cache_len + step;
+
+        // Embedding: each XCD fills its OWN hidden replica for all B rows.
+        {
+            int lt  = mfma_lbid(xcd) * MFMA_BLOCK_SIZE + threadIdx.x;
+            int nlt = mfma_lnb(xcd) * MFMA_BLOCK_SIZE;
+            __nv_bfloat16* h = hidden + (size_t)xcd * rep;
+            for (int t = lt; t < B * HIDDEN_SIZE; t += nlt) {
+                int b = t / HIDDEN_SIZE, i = t % HIDDEN_SIZE;
+                h[(size_t)b * HIDDEN_SIZE + i] = embed_weight[(size_t)cur_tokens[b] * HIDDEN_SIZE + i];
+            }
+        }
+        MQ_LOCAL_BARRIER();
+
+        for (int layer = 0; layer < num_layers; layer++) {
+            const MFMALayerWeights& w = layer_weights[layer];
+            const __bf16* norm_rep = BF(g_normalized) + (size_t)xcd * rep;
+
+            rmsnorm_xcd(hidden, w.input_layernorm_weight, g_normalized, g_residual, B, Mpad, HIDDEN_SIZE, xcd);
+            MQ_LOCAL_BARRIER();
+
+#if MQ_FP8_WEIGHTS
+            gemm_xcd_out_fp8<float>(norm_rep, FP8(w.q_proj_weight), w.q_proj_scale, g_q, Mpad, HIDDEN_SIZE, Q_SIZE,
+                                    xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+            gemm_xcd_out_fp8<float>(norm_rep, FP8(w.k_proj_weight), w.k_proj_scale, g_k, Mpad, HIDDEN_SIZE, KV_SIZE,
+                                    xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+            gemm_xcd_out_fp8<float>(norm_rep, FP8(w.v_proj_weight), w.v_proj_scale, g_v, Mpad, HIDDEN_SIZE, KV_SIZE,
+                                    xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+#else
+            gemm_xcd_out<float>(norm_rep, BF(w.q_proj_weight), g_q, Mpad, HIDDEN_SIZE, Q_SIZE,
+                                xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+            gemm_xcd_out<float>(norm_rep, BF(w.k_proj_weight), g_k, Mpad, HIDDEN_SIZE, KV_SIZE,
+                                xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+            gemm_xcd_out<float>(norm_rep, BF(w.v_proj_weight), g_v, Mpad, HIDDEN_SIZE, KV_SIZE,
+                                xcd * (XCD_KV_HEADS * HEAD_DIM), XCD_KV_HEADS * HEAD_DIM, xcd);
+#endif
+            MQ_LOCAL_BARRIER();
+
+            qk_rope_cache_xcd(g_q, g_k, g_v, w.q_norm_weight, w.k_norm_weight,
+                              cos_table, sin_table, k_cache, v_cache,
+                              B, layer, num_layers, position, max_seq_len, xcd);
+            MQ_LOCAL_BARRIER();
+
+            attention_xcd(g_q, k_cache, v_cache, g_attn_out,
+                          B, layer, num_layers, cache_len, max_seq_len, attn_scale, xcd);
+            MQ_LOCAL_BARRIER();
+
+#if MQ_FP8_WEIGHTS
+            gemm_xcd_partial_fp8(BF(g_attn_out), FP8(w.o_proj_weight), w.o_proj_scale, g_partial + (size_t)xcd * rep,
+                                 Mpad, Q_SIZE, HIDDEN_SIZE, xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+#else
+            gemm_xcd_partial(BF(g_attn_out), BF(w.o_proj_weight), g_partial + (size_t)xcd * rep,
+                             Mpad, Q_SIZE, HIDDEN_SIZE, xcd * XCD_Q_COLS, XCD_Q_COLS, xcd);
+#endif
+            grid.sync();  // CROSS-XCD: publish all O-proj partials
+
+            allreduce_add_resid<float>(g_partial, g_residual, g_activations, Mpad, HIDDEN_SIZE, xcd);
+            MQ_LOCAL_BARRIER();
+
+            rmsnorm_xcd(g_activations, w.post_attn_layernorm_weight, g_normalized, g_residual, B, Mpad, HIDDEN_SIZE, xcd);
+            MQ_LOCAL_BARRIER();
+
+#if MQ_FP8_WEIGHTS
+            gemm_xcd_out_fp8<float>(norm_rep, FP8(w.gate_proj_weight), w.gate_proj_scale, g_gate, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                    xcd * XCD_INT, XCD_INT, xcd);
+            gemm_xcd_out_fp8<float>(norm_rep, FP8(w.up_proj_weight), w.up_proj_scale, g_up, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                    xcd * XCD_INT, XCD_INT, xcd);
+#else
+            gemm_xcd_out<float>(norm_rep, BF(w.gate_proj_weight), g_gate, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                xcd * XCD_INT, XCD_INT, xcd);
+            gemm_xcd_out<float>(norm_rep, BF(w.up_proj_weight), g_up, Mpad, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                xcd * XCD_INT, XCD_INT, xcd);
+#endif
+            MQ_LOCAL_BARRIER();
+
+            silu_mul_xcd(g_gate, g_up, g_mlp, B, Mpad, xcd);
+            MQ_LOCAL_BARRIER();
+
+#if MQ_FP8_WEIGHTS
+            gemm_xcd_partial_fp8(BF(g_mlp), FP8(w.down_proj_weight), w.down_proj_scale, g_partial + (size_t)xcd * rep,
+                                 Mpad, INTERMEDIATE_SIZE, HIDDEN_SIZE, xcd * XCD_INT, XCD_INT, xcd);
+#else
+            gemm_xcd_partial(BF(g_mlp), BF(w.down_proj_weight), g_partial + (size_t)xcd * rep,
+                             Mpad, INTERMEDIATE_SIZE, HIDDEN_SIZE, xcd * XCD_INT, XCD_INT, xcd);
+#endif
+            grid.sync();  // CROSS-XCD: publish all down-proj partials
+
+            allreduce_add_resid<__nv_bfloat16>(g_partial, g_residual, hidden, Mpad, HIDDEN_SIZE, xcd);
+            MQ_LOCAL_BARRIER();
+        }
+
+        // Final RMSNorm (own replica) -> g_normalized; LM head reads replica 0.
+        rmsnorm_xcd(hidden, final_norm_weight, g_normalized, nullptr, B, Mpad, HIDDEN_SIZE, xcd);
+        grid.sync();  // CROSS-XCD: replica 0 fully written before the LM GEMM reads it
+
+        // LM head (in-kernel): logits then greedy argmax -> next tokens.
+        lm_head_gemm_grid(BF(g_normalized), (const __bf16*)lm_head_weight, lm_logits, Mpad, HIDDEN_SIZE, MFMA_VOCAB_SIZE);
+        grid.sync();
+        lm_argmax_grid(lm_logits, cur_tokens, output_tokens + (size_t)step * B, B, MFMA_VOCAB_SIZE);
+        grid.sync();  // cur_tokens visible to every block before the next step's embedding
+    }
+
+    #undef MQ_LOCAL_BARRIER
+}
+
+// =============================================================================
 // Launch
 // =============================================================================
+
+// Defined below; the cooperative launch grid MUST equal the block count the
+// intra-XCD barrier's nb_xcd[] was built for (see megakernel_batched_xcd.py),
+// otherwise the barrier waits on blocks that never launched -> deadlock. Route
+// both through this one helper (device-fill for the sharded kernel).
+extern "C" int mq_xcd_grid_blocks();
+extern "C" int mq_xcd_grid_blocks_for_batch(int B);
 
 extern "C" void launch_mfma_xcd_decode(
     const int* input_tokens, int* output_tokens,
@@ -556,7 +858,11 @@ extern "C" void launch_mfma_xcd_decode(
         (void*)&position, (void*)&cache_len, (void*)&max_seq_len, (void*)&attn_scale
     };
 
-    static int grid_blocks = mq_coop_grid_blocks((void*)mfma_xcd_decode_kernel, MFMA_BLOCK_SIZE, 0);
+    // Same grid the barrier's nb_xcd[] was sized for. Batch-adaptive (fewer blocks at
+    // low batch cut barrier cost); the ctor fills nb_xcd for the same B. MQ_GRID_BLOCKS
+    // overrides. Using the capped flat-kernel grid here would under-launch every XCD
+    // and hang the intra-XCD barrier.
+    int grid_blocks = mq_xcd_grid_blocks_for_batch(B);
     cudaLaunchCooperativeKernel((void*)mfma_xcd_decode_kernel, dim3(grid_blocks),
                                 dim3(MFMA_BLOCK_SIZE), kernel_args, 0, stream);
 
@@ -571,8 +877,68 @@ extern "C" void launch_mfma_xcd_decode(
         (const float*)lm_logits, output_tokens, MFMA_VOCAB_SIZE, MFMA_VOCAB_SIZE);
 }
 
+// Multi-token: ONE cooperative launch runs the whole generation phase on-device.
+// No per-token host round trip, no per-token LM-head launches, no cooperative
+// relaunch. output_tokens is [num_steps, B]; cur_tokens is [B] device scratch.
+extern "C" void launch_mfma_xcd_decode_multi(
+    const int* input_tokens, int* cur_tokens, int* output_tokens,
+    const void* embed_weight, const MFMALayerWeights* layer_weights,
+    const void* final_norm_weight, const void* lm_head_weight,
+    const void* cos_table, const void* sin_table,
+    void* k_cache, void* v_cache,
+    void* hidden, void* g_normalized, void* g_residual,
+    void* g_q, void* g_k, void* g_v,
+    void* g_attn_out, void* g_activations, void* g_partial,
+    void* g_gate, void* g_up, void* g_mlp,
+    void* lm_logits,
+    int* bar_arrive, int* bar_sense, const int* nb_xcd,
+    int B, int Mpad, int num_layers, int base_position, int base_cache_len,
+    int max_seq_len, float attn_scale, int num_steps, cudaStream_t stream) {
+
+    void* kernel_args[] = {
+        (void*)&input_tokens, (void*)&cur_tokens, (void*)&output_tokens,
+        (void*)&embed_weight, (void*)&layer_weights, (void*)&final_norm_weight,
+        (void*)&lm_head_weight, (void*)&cos_table, (void*)&sin_table,
+        (void*)&k_cache, (void*)&v_cache, (void*)&hidden, (void*)&g_normalized,
+        (void*)&g_residual, (void*)&g_q, (void*)&g_k, (void*)&g_v,
+        (void*)&g_attn_out, (void*)&g_activations, (void*)&g_partial,
+        (void*)&g_gate, (void*)&g_up, (void*)&g_mlp, (void*)&lm_logits,
+        (void*)&bar_arrive, (void*)&bar_sense, (void*)&nb_xcd,
+        (void*)&B, (void*)&Mpad, (void*)&num_layers,
+        (void*)&base_position, (void*)&base_cache_len, (void*)&max_seq_len,
+        (void*)&attn_scale, (void*)&num_steps
+    };
+
+    int grid_blocks = mq_xcd_grid_blocks_for_batch(B);
+    cudaLaunchCooperativeKernel((void*)mfma_xcd_decode_multi_kernel, dim3(grid_blocks),
+                                dim3(MFMA_BLOCK_SIZE), kernel_args, 0, stream);
+}
+
 // Host helper: fill nb_xcd[x] = #blocks with blockIdx.x % 8 == x for the grid the
 // cooperative launch will use (so the intra-XCD barrier knows its arrival target).
 extern "C" int mq_xcd_grid_blocks() {
-    return mq_coop_grid_blocks((void*)mfma_xcd_decode_kernel, MFMA_BLOCK_SIZE, 0);
+    // Device-fill (one block/CU, rounded to a multiple of 8 XCDs). The sharded
+    // kernel scales with grid size where the flat kernel collapses; measured best
+    // at device-fill on the batched MFMA path. MQ_GRID_BLOCKS overrides.
+    return mq_coop_grid_blocks_fill((void*)mfma_xcd_decode_kernel, MFMA_BLOCK_SIZE, 0, 8);
+}
+
+// Batch-adaptive cooperative grid. Profiling (rocprofv3 + grid sweep, MI300X) showed
+// this kernel is BARRIER-serialization bound, not HBM/occupancy bound: every extra
+// block is another participant in the ~140 grid.sync barriers/token, and barrier cost
+// grows with block count. So the throughput-optimal grid shrinks at low batch, where
+// there isn't enough MFMA work to amortize the barrier. Measured optima (tok/s peak):
+//   B<=4 -> base/4 (72 on 304-CU),  B<=32 -> base/2 (152),  B>=64 -> base (304).
+// Encoded as fractions of the device-fill base so it ports to other CU counts. The
+// ctor's nb_xcd[] fill and BOTH launch sites must pass the same B, or the intra-XCD
+// barrier's arrival target won't match the launched grid and it will deadlock.
+extern "C" int mq_xcd_grid_blocks_for_batch(int B) {
+    if (const char* env = getenv("MQ_GRID_BLOCKS")) { int v = atoi(env); if (v > 0) return v; }
+    static int base = mq_xcd_grid_blocks();     // device-fill, already a multiple of 8
+    int g = base;
+    if (B <= 4)       g = base / 4;
+    else if (B <= 32) g = base / 2;
+    g = (g / MQ_NXCD) * MQ_NXCD;                 // keep XCD-balanced (blockIdx.x % 8)
+    if (g < MQ_NXCD) g = MQ_NXCD;
+    return g;
 }

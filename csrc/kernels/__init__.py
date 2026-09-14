@@ -1,9 +1,13 @@
 """CUDA kernels for Qwen3 inference."""
 
 import os
+import sys
 
 import torch
 from torch.utils.cpp_extension import load_inline
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from build_flags import cuda_cflags  # CUDA/ROCm-aware extra_cuda_cflags
 
 _cuda_kernels = None
 
@@ -289,7 +293,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         name="qwen3_cuda_kernels",
         cpp_sources=[cpp_src],
         cuda_sources=[combined_cuda_src],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=cuda_cflags(),
         verbose=False,
     )
 

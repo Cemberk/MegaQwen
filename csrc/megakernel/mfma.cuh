@@ -90,4 +90,72 @@ __device__ __forceinline__ void mq_mfma_tile_store_add(
     }
 }
 
+// =============================================================================
+// fp8 WEIGHT-ONLY path (W8A16): activations stay bf16, weights are e4m3fnuz.
+// Cuts weight HBM traffic ~2x on the bandwidth-bound decode. The weight is
+// dequantized per-output-channel: W_bf16[n][k] = W_fp8[n][k] * s[n]. Since s[n]
+// factors out of the K-sum, the MFMA runs on the *unscaled* fp8->bf16 weight and
+// s[n] is folded into the store epilogue (one scale/lane/tile). MI300 fp8 is
+// FNUZ (max normal ~240); torch dtype float8_e4m3fnuz is bit-compatible with
+// __hip_fp8_e4m3_fnuz. Accuracy validated (probe_fp8_accuracy.py: 40/40 identical
+// greedy vs bf16). See project memory "#28 fp8".
+#include <hip/hip_fp8.h>
+typedef __hip_fp8_e4m3_fnuz mq_fp8;
+
+// Accumulate one 16x16 tile over full K with bf16 A and fp8 W (converted to bf16
+// per element before the bf16 MFMA). No scale applied here — folded into store.
+__device__ __forceinline__ void mq_mfma_tile_accum_fp8(
+    const __bf16* __restrict__ A,   // [M, in] row-major bf16
+    const mq_fp8* __restrict__ W,   // [out, in] row-major fp8 e4m3fnuz
+    int in_dim, int m0, int n0, mq_f32x4& acc) {
+    int lane = threadIdx.x & 63;
+    int rc = lane & 15, grp = lane >> 4;
+    const __bf16* arow = A + (m0 + rc) * in_dim;
+    const mq_fp8* wrow = W + (n0 + rc) * in_dim;
+    for (int k0 = 0; k0 < in_dim; k0 += 16) {
+        mq_bf16x4 a, b;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            a[i] = arow[k0 + grp * 4 + i];
+            b[i] = (__bf16)(float)wrow[k0 + grp * 4 + i];
+        }
+        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+    }
+}
+
+// fp8 K-range variant (for XCD-sharded contract projections: O-proj, down-proj).
+__device__ __forceinline__ void mq_mfma_tile_accum_krange_fp8(
+    const __bf16* __restrict__ A,   // [M, in] row-major bf16
+    const mq_fp8* __restrict__ W,   // [out, in] row-major fp8 e4m3fnuz
+    int in_dim, int k0, int k1, int m0, int n0, mq_f32x4& acc) {
+    int lane = threadIdx.x & 63;
+    int rc = lane & 15, grp = lane >> 4;
+    const __bf16* arow = A + (m0 + rc) * in_dim;
+    const mq_fp8* wrow = W + (n0 + rc) * in_dim;
+    for (int kk = k0; kk < k1; kk += 16) {
+        mq_bf16x4 a, b;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            a[i] = arow[kk + grp * 4 + i];
+            b[i] = (__bf16)(float)wrow[kk + grp * 4 + i];
+        }
+        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+    }
+}
+
+// Store a 16x16 tile with a per-output-channel dequant scale folded in:
+// C[m0+grp*4+i][n0+rc] = acc[i] * scale[n0+rc]. Each lane owns one output column
+// (n0+rc) across its 4 rows, so it reads a single scale value. `scale` is the
+// full per-output-channel vector (length out_dim). T = float or __bf16.
+template <typename T>
+__device__ __forceinline__ void mq_mfma_tile_store_scaled(
+    T* __restrict__ C, const float* __restrict__ scale, int ld_out,
+    int m0, int n0, const mq_f32x4& acc) {
+    int lane = threadIdx.x & 63;
+    int cn = lane & 15, grp = lane >> 4;
+    float s = scale[n0 + cn];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) C[(m0 + grp * 4 + i) * ld_out + (n0 + cn)] = (T)(acc[i] * s);
+}
+
 #endif  // ROCm

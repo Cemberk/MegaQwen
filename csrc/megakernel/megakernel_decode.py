@@ -5,9 +5,15 @@ Includes prefill support using fused_prefill.cu with cuBLAS.
 """
 
 import os
+import sys
 
 import torch
 from torch.utils.cpp_extension import load_inline
+
+# Repo root on path so the shared flag helper imports regardless of entry point
+# (verify_correctness.py / benchmark_suite.py insert csrc/megakernel, not root).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from build_flags import cuda_cflags, ld_flags  # CUDA/ROCm-aware build flags
 
 _decode_kernel = None
 _prefill_kernel = None
@@ -248,14 +254,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         name="megakernel_decode",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++17",
-            "-arch=sm_86",
-            "--expt-relaxed-constexpr",
-            "-I" + kernel_dir,
-        ],
+        extra_cuda_cflags=cuda_cflags(include_dirs=[kernel_dir], nvcc_extra=["-arch=sm_86"]),
         verbose=False,
     )
 
@@ -667,15 +666,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         name="megakernel_prefill",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src, decode_cuda_src],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++17",
-            "-arch=sm_86",
-            "--expt-relaxed-constexpr",
-            "-I" + kernel_dir,
-        ],
-        extra_ldflags=["-lcublas"],
+        extra_cuda_cflags=cuda_cflags(include_dirs=[kernel_dir], nvcc_extra=["-arch=sm_86"]),
+        extra_ldflags=ld_flags(["cublas"]),  # -lhipblas on ROCm
         verbose=False,
     )
 
@@ -1060,14 +1052,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         name="megakernel_fused_prefill",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src, decode_cuda_src],
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++17",
-            "-arch=sm_86",
-            "--expt-relaxed-constexpr",
-            "-I" + kernel_dir,
-        ],
+        extra_cuda_cflags=cuda_cflags(include_dirs=[kernel_dir], nvcc_extra=["-arch=sm_86"]),
         verbose=False,
     )
 

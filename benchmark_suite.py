@@ -95,19 +95,49 @@ def benchmark_megakernel(decode_tokens: int = 100) -> BenchmarkResult:
 
     return result
 
+def benchmark_fused_prefill(decode_tokens: int = 100, prompt: str = "Hello") -> BenchmarkResult:
+    """Benchmark the fused-prefill megakernel (BLAS-free one-shot prefill + decode)."""
+    from megakernel_decode import MegakernelFusedPrefillGenerator
+
+    print("  Loading fused-prefill megakernel...")
+    gen = MegakernelFusedPrefillGenerator()
+
+    def generate():
+        gen.generate(prompt, max_new_tokens=decode_tokens)
+
+    result = run_benchmark("Megakernel (fused prefill)", generate, tokens=decode_tokens)
+
+    del gen
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return result
+
+def device_banner() -> str:
+    backend = "ROCm/HIP" if getattr(torch.version, "hip", None) else "CUDA"
+    name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no GPU"
+    return f"{backend} | {name}"
+
 def main():
     print("=" * 60)
     print("MegaQwen Benchmark Suite")
+    print(f"Device: {device_banner()}")
     print("=" * 60)
     print()
 
     results = []
 
-    print("[1/2] PyTorch (HuggingFace)")
+    print("[1/3] PyTorch (HuggingFace)")
     results.append(benchmark_pytorch_hf())
 
-    print("[2/2] Megakernel")
+    print("[2/3] Megakernel (decode)")
     results.append(benchmark_megakernel())
+
+    print("[3/3] Megakernel (fused prefill)")
+    try:
+        results.append(benchmark_fused_prefill())
+    except Exception as e:
+        print(f"  [skip] fused-prefill benchmark unavailable: {e}")
 
     print()
     print("=" * 60)

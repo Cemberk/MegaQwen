@@ -60,7 +60,7 @@ struct PrefillMKLayerWeights {
 __device__ __forceinline__ float prefill_mk_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += __shfl_down_sync(WARP_FULL_MASK, val, offset);
     }
     return val;
 }
@@ -68,7 +68,7 @@ __device__ __forceinline__ float prefill_mk_warp_reduce_sum(float val) {
 __device__ __forceinline__ float prefill_mk_warp_reduce_max(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = fmaxf(val, __shfl_down_sync(WARP_FULL_MASK, val, offset));
     }
     return val;
 }
@@ -102,7 +102,7 @@ __device__ void prefill_mk_embedding(
         int token_idx = idx / HIDDEN_SIZE;
         int dim_idx = idx % HIDDEN_SIZE;
         int token_id = token_ids[token_idx];
-        hidden[idx] = __bfloat162float(__ldg(embed_weight + token_id * HIDDEN_SIZE + dim_idx));
+        hidden[idx] = __bfloat162float(LDG(embed_weight + token_id * HIDDEN_SIZE + dim_idx));
     }
 
     grid.sync();
@@ -166,7 +166,7 @@ __device__ void prefill_mk_rmsnorm(
 
         // Apply normalization
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += PREFILL_MK_BLOCK_SIZE) {
-            float w = __bfloat162float(__ldg(weight + i));
+            float w = __bfloat162float(LDG(weight + i));
             out_row[i] = in_row[i] * rstd * w;
         }
         __syncthreads();
@@ -240,7 +240,7 @@ __device__ void prefill_mk_qkv_projection(
             float sum = 0.0f;
             #pragma unroll 8
             for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-                uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(weight_row + k));
+                uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(weight_row + k));
                 __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
                 sum += __bfloat162float(w_ptr[0]) * input_row[k] +
@@ -307,25 +307,25 @@ __device__ void prefill_mk_qk_norm_rope_cache(
             }
             sum_sq = prefill_mk_warp_reduce_sum(sum_sq);
             float scale = rsqrtf(sum_sq / float(HEAD_DIM) + PREFILL_MK_RMS_EPS);
-            scale = __shfl_sync(0xffffffff, scale, 0);
+            scale = __shfl_sync(WARP_FULL_MASK, scale, 0);
 
             // Load normalized Q to registers
             float q_local[HEAD_DIM / WARP_SIZE];
             #pragma unroll
             for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-                q_local[j] = q_head[i] * scale * __bfloat162float(__ldg(q_norm_weight + i));
+                q_local[j] = q_head[i] * scale * __bfloat162float(LDG(q_norm_weight + i));
             }
 
             // Apply RoPE
             #pragma unroll
             for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-                float cos_v = __bfloat162float(__ldg(cos_pos + i));
-                float sin_v = __bfloat162float(__ldg(sin_pos + i));
+                float cos_v = __bfloat162float(LDG(cos_pos + i));
+                float sin_v = __bfloat162float(LDG(sin_pos + i));
 
                 int pair_offset = (i < HEAD_DIM/2) ? HEAD_DIM/2 : -HEAD_DIM/2;
                 int pair_idx = i + pair_offset;
                 int pair_j = pair_idx / WARP_SIZE;
-                float pair_v = __shfl_sync(0xffffffff, q_local[pair_j], pair_idx % WARP_SIZE);
+                float pair_v = __shfl_sync(WARP_FULL_MASK, q_local[pair_j], pair_idx % WARP_SIZE);
 
                 if (i < HEAD_DIM/2) {
                     q_head[i] = q_local[j] * cos_v - pair_v * sin_v;
@@ -364,25 +364,25 @@ __device__ void prefill_mk_qk_norm_rope_cache(
             }
             sum_sq = prefill_mk_warp_reduce_sum(sum_sq);
             float scale = rsqrtf(sum_sq / float(HEAD_DIM) + PREFILL_MK_RMS_EPS);
-            scale = __shfl_sync(0xffffffff, scale, 0);
+            scale = __shfl_sync(WARP_FULL_MASK, scale, 0);
 
             // Load normalized K to registers
             float k_local[HEAD_DIM / WARP_SIZE];
             #pragma unroll
             for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-                k_local[j] = k_head[i] * scale * __bfloat162float(__ldg(k_norm_weight + i));
+                k_local[j] = k_head[i] * scale * __bfloat162float(LDG(k_norm_weight + i));
             }
 
             // Apply RoPE and write to cache
             #pragma unroll
             for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-                float cos_v = __bfloat162float(__ldg(cos_pos + i));
-                float sin_v = __bfloat162float(__ldg(sin_pos + i));
+                float cos_v = __bfloat162float(LDG(cos_pos + i));
+                float sin_v = __bfloat162float(LDG(sin_pos + i));
 
                 int pair_offset = (i < HEAD_DIM/2) ? HEAD_DIM/2 : -HEAD_DIM/2;
                 int pair_idx = i + pair_offset;
                 int pair_j = pair_idx / WARP_SIZE;
-                float pair_v = __shfl_sync(0xffffffff, k_local[pair_j], pair_idx % WARP_SIZE);
+                float pair_v = __shfl_sync(WARP_FULL_MASK, k_local[pair_j], pair_idx % WARP_SIZE);
 
                 float k_final;
                 if (i < HEAD_DIM/2) {
@@ -463,7 +463,7 @@ __device__ void prefill_mk_causal_attention(
                 }
 
                 score = prefill_mk_warp_reduce_sum(score) * attn_scale;
-                score = __shfl_sync(0xffffffff, score, 0);
+                score = __shfl_sync(WARP_FULL_MASK, score, 0);
 
                 // Online softmax
                 float old_max = max_score;
@@ -528,7 +528,7 @@ __device__ void prefill_mk_o_proj_residual(
             float sum = 0.0f;
             #pragma unroll 8
             for (int k = lane_id * 4; k < Q_SIZE; k += WARP_SIZE * 4) {
-                uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(o_row + k));
+                uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(o_row + k));
                 __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
                 sum += __bfloat162float(w_ptr[0]) * attn_row[k] +
@@ -587,8 +587,8 @@ __device__ void prefill_mk_mlp_gate_up(
 
             #pragma unroll 8
             for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-                uint2 g_u2 = __ldg(reinterpret_cast<const uint2*>(gate_row + k));
-                uint2 u_u2 = __ldg(reinterpret_cast<const uint2*>(up_row + k));
+                uint2 g_u2 = LDG(reinterpret_cast<const uint2*>(gate_row + k));
+                uint2 u_u2 = LDG(reinterpret_cast<const uint2*>(up_row + k));
                 __nv_bfloat16* g_ptr = reinterpret_cast<__nv_bfloat16*>(&g_u2);
                 __nv_bfloat16* u_ptr = reinterpret_cast<__nv_bfloat16*>(&u_u2);
 
@@ -656,7 +656,7 @@ __device__ void prefill_mk_mlp_down_residual(
             float sum = 0.0f;
             #pragma unroll 8
             for (int k = lane_id * 4; k < INTERMEDIATE_SIZE; k += WARP_SIZE * 4) {
-                uint2 d_u2 = __ldg(reinterpret_cast<const uint2*>(down_row + k));
+                uint2 d_u2 = LDG(reinterpret_cast<const uint2*>(down_row + k));
                 __nv_bfloat16* d_ptr = reinterpret_cast<__nv_bfloat16*>(&d_u2);
 
                 sum += __bfloat162float(d_ptr[0]) * mlp_row[k] +
@@ -722,7 +722,7 @@ __device__ void prefill_mk_final_norm(
 
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += PREFILL_MK_BLOCK_SIZE) {
             float v = in_row[i];
-            float w = __bfloat162float(__ldg(weight + i));
+            float w = __bfloat162float(LDG(weight + i));
             float result = v * rstd * w;
             output[i] = result;
             hidden_bf16_out[i] = __float2bfloat16(v);  // Pre-normalized for decode
@@ -842,7 +842,7 @@ __global__ void prefill_mk_lm_head_phase1(
         float sum = 0.0f;
         #pragma unroll 8
         for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-            uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(w_row + k));
+            uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(w_row + k));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
             sum += __bfloat162float(w_ptr[0]) * s_hidden[k] +
@@ -858,8 +858,8 @@ __global__ void prefill_mk_lm_head_phase1(
         }
     }
 
-    local_max = __shfl_sync(0xffffffff, local_max, 0);
-    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+    local_max = __shfl_sync(WARP_FULL_MASK, local_max, 0);
+    local_max_idx = __shfl_sync(WARP_FULL_MASK, local_max_idx, 0);
 
     __shared__ float warp_max[PREFILL_MK_LM_BLOCK_SIZE / WARP_SIZE];
     __shared__ int warp_idx[PREFILL_MK_LM_BLOCK_SIZE / WARP_SIZE];
@@ -875,8 +875,8 @@ __global__ void prefill_mk_lm_head_phase1(
         int max_idx = (lane_id < PREFILL_MK_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
 
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
-            int other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            float other_val = __shfl_down_sync(WARP_FULL_MASK, max_val, offset);
+            int other_idx = __shfl_down_sync(WARP_FULL_MASK, max_idx, offset);
             if (other_val > max_val) {
                 max_val = other_val;
                 max_idx = other_idx;
@@ -990,9 +990,13 @@ extern "C" void launch_prefill_megakernel(
         (void*)&attn_scale
     };
 
+    // Device-derived cooperative grid (MI300X 304 CUs vs hardcoded 82). Kernel is
+    // grid-stride (num_blocks = gridDim.x), so any co-resident count is correct.
+    static int prefill_mk_grid_blocks =
+        mq_coop_grid_blocks((void*)prefill_megakernel, PREFILL_MK_BLOCK_SIZE, 0);
     cudaLaunchCooperativeKernel(
         (void*)prefill_megakernel,
-        dim3(PREFILL_MK_NUM_BLOCKS),
+        dim3(prefill_mk_grid_blocks),
         dim3(PREFILL_MK_BLOCK_SIZE),
         kernel_args,
         0,

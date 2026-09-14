@@ -46,7 +46,7 @@ struct PrefillLayerWeights {
 __device__ __forceinline__ float prefill_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += __shfl_down_sync(WARP_FULL_MASK, val, offset);
     }
     return val;
 }
@@ -54,7 +54,7 @@ __device__ __forceinline__ float prefill_warp_reduce_sum(float val) {
 __device__ __forceinline__ float prefill_warp_reduce_max(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = fmaxf(val, __shfl_down_sync(WARP_FULL_MASK, val, offset));
     }
     return val;
 }
@@ -359,7 +359,7 @@ __global__ void prefill_causal_attention_kernel(
         // Warp reduction for dot product
         score = prefill_warp_reduce_sum(score) * attn_scale;
         // Broadcast reduced score to all lanes (only lane 0 has correct value after reduction)
-        score = __shfl_sync(0xffffffff, score, 0);
+        score = __shfl_sync(WARP_FULL_MASK, score, 0);
 
         // Online softmax
         float old_max = max_score;
@@ -505,7 +505,7 @@ __global__ void prefill_lm_head_phase1(
         float sum = 0.0f;
         #pragma unroll 8
         for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
-            uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(w_row + k));
+            uint2 w_u2 = LDG(reinterpret_cast<const uint2*>(w_row + k));
             __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
 
             sum += __bfloat162float(w_ptr[0]) * s_hidden[k] +
@@ -521,8 +521,8 @@ __global__ void prefill_lm_head_phase1(
         }
     }
 
-    local_max = __shfl_sync(0xffffffff, local_max, 0);
-    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+    local_max = __shfl_sync(WARP_FULL_MASK, local_max, 0);
+    local_max_idx = __shfl_sync(WARP_FULL_MASK, local_max_idx, 0);
 
     __shared__ float warp_max[PREFILL_LM_BLOCK_SIZE / WARP_SIZE];
     __shared__ int warp_idx[PREFILL_LM_BLOCK_SIZE / WARP_SIZE];
@@ -538,8 +538,8 @@ __global__ void prefill_lm_head_phase1(
         int max_idx = (lane_id < PREFILL_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
 
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
-            int other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            float other_val = __shfl_down_sync(WARP_FULL_MASK, max_val, offset);
+            int other_idx = __shfl_down_sync(WARP_FULL_MASK, max_idx, offset);
             if (other_val > max_val) {
                 max_val = other_val;
                 max_idx = other_idx;
