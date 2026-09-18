@@ -36,9 +36,30 @@ Honest read: **vLLM's continuous batching + graph capture still leads at every
 batch size**, and the gap widens with B (barrier cost grows with the cooperative
 grid). But the single-persistent-kernel design is now within ~2–3× at serving
 batches, up from ~4–7×, entirely from launch-config topology awareness — no change
-to the per-thread math. Closing the rest is the Stage-2 hierarchical-barrier work
-(replace the flat cross-XCD `grid.sync` with intra-XCD sync + a rare cross-XCD
-reduction).
+to the per-thread math.
+
+**The hierarchical-barrier lever is measured, and it is a *substitute* for the
+adaptive grid, not additive (task #27, closed).** There are two independent ways to
+attack the cross-XCD barrier cost: (A) launch *fewer* cooperative blocks so the flat
+`grid.sync` has fewer cross-die participants (the adaptive grid), or (B) keep the full
+grid but replace the 9 per-layer local barriers with the intra-XCD sense-reversing
+barrier (`MQ_XCD_HIER=1`, S0c), leaving only the 2 true cross-XCD reductions/layer as
+`grid.sync`. An A/B at B=1 isolates them (`hier_ab.py`, bit-identical tokens both ways):
+
+| grid | hier=0 (all `grid.sync`) | hier=1 (intra-XCD) | hier speedup |
+|---|---|---|---|
+| 304 (full device) | 77.0 | 132.8 | **1.73×** |
+| 76 (adaptive)     | 190.4 | 190.6 | 1.00× (wash) |
+
+So the intra-XCD barrier is a genuine **1.7× lever on a full-device grid** — but the
+adaptive grid alone (190) already beats hier-on-full-grid (133), and stacking hier on
+top of the adaptive grid is a wash (1.00×, and likewise 0.996–1.004× at B=8/32). Both
+levers cash out the *same* barrier-serialization cost, so they don't compose. The
+adaptive grid is kept as the default; the hierarchical barrier stays a
+validated-correct compile switch (`MQ_XCD_HIER`, default on) for regimes forced to a
+full grid, and no barrier-*count* reduction is warranted under the current per-batch
+grid policy. Remaining gap to vLLM is therefore scheduling/batching (continuous
+batching + graph capture), not barrier structure.
 
 **Why it works — the megakernel is barrier-bound at low batch, not bandwidth-bound.**
 Profiling the single-step kernel showed the limiter is `grid.sync()` / barrier
@@ -171,6 +192,18 @@ Each block reads its XCD id (S0b), self-assigns to the weight shard cached in th
 XCD's L2 (+ NPS memory mode); hierarchical barrier (S0c) replaces the ~140×/token
 flat `grid.sync` — full cross-XCD barrier only where a reduction spans XCDs
 (O-proj + down-proj all-reduce, final norm). Same cut points as Phase-2 TP.
+
+- **Hierarchical barrier: DONE + measured (task #27, 2026-09-18).** Wired into the
+  batched kernel as the `MQ_XCD_HIER` compile switch (per layer: 2 cross-XCD
+  `grid.sync` + 9 intra-XCD `mq_xcd_bar`); `hier=0/1` compile to separate modules
+  (`megakernel_batched_xcd_h{0,1}`) so an in-process A/B is exact. Result (see "Latest
+  results" table above): **1.73× at B=1 on a full-device grid, but a wash at the
+  adaptive grid** — the adaptive grid already extracts the barrier win, so the two are
+  substitutes. Bit-identical tokens both ways. Conclusion: adaptive grid is the
+  default lever; the hier barrier is retained as a validated compile option, and
+  barrier-count reduction is **not** pursued because it is non-additive under the
+  current grid policy. The remaining Stage-2 item (XCD-local weight *sharding* in each
+  XCD's L2) is orthogonal to the barrier and still open.
 
 ### Stage 3 — compose with CPX (throughput)
 CPX = 8 XCD partitions; run one batched-MFMA instance per partition (data-parallel
