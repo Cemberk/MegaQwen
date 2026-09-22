@@ -103,14 +103,19 @@ vLLM `ignore_eos + min_tokens=100`), greedy, one MI300X GPU (GPU 0), TOTAL tok/s
 vLLM = v0.27.1 ROCm in a self-created `--rm` container (V1 engine, CUDA graphs,
 end-to-end incl. the ~11-tok prefill).
 
-| B | MegaQwen MFMA TOTAL | vLLM v0.27.1 TOTAL | MegaQwen ÷ vLLM |
-|---|---|---|---|
-| 1  | 117  | 396   | 0.30× |
-| 4  | 465  | 1993  | 0.23× |
-| 8  | 870  | 3443  | 0.25× |
-| 16 | 1541 | 6856  | 0.22× |
-| 32 | 2398 | 12616 | 0.19× |
-| 64 | 3256 | **23461** | **0.14×** |
+| B | MegaQwen MFMA TOTAL | vLLM v0.27.1 TOTAL | SGLang v0.5.20 TOTAL | MegaQwen ÷ vLLM |
+|---|---|---|---|---|
+| 1  | 117  | 396   | 523   | 0.30× |
+| 4  | 465  | 1993  | 1685  | 0.23× |
+| 8  | 870  | 3443  | 3221  | 0.25× |
+| 16 | 1541 | 6856  | 6159  | 0.22× |
+| 32 | 2398 | 12616 | 10820 | 0.19× |
+| 64 | 3256 | **23461** | 17600 | **0.14×** |
+
+SGLang (v0.5.20 ROCm, aiter backend, `disable_radix_cache`, same 100-tok greedy
+workload, self-created `--rm` container) added 2026-09-22 (task #15). It is the
+*fastest* engine at B=1 (523 vs vLLM 396) but falls behind vLLM's continuous
+batching as B grows (17600 vs 23461 at B=64). MegaQwen trails both at every batch.
 
 **Honest read (this corrects the earlier "6.09× vLLM" framing):** that number
 compared MegaQwen's B=64 TOTAL against vLLM's *batch-1* figure — apples-to-oranges.
@@ -121,7 +126,8 @@ the S0c prediction: the flat cross-XCD `grid.sync` (~252/token) is a hard
 ~3.1 ms/token ≈ 320 tok/s/seq ceiling that vLLM sidesteps with continuous
 batching + graph capture. **The fair table does not undercut the plan — it is the
 strongest motivation for Stage 2 (XCD-aware hierarchical barrier + weight
-sharding), which attacks precisely this ceiling.** SGLang row still TODO.
+sharding), which attacks precisely this ceiling.** SGLang (added below) confirms
+the pattern: another production engine that beats MegaQwen at every batch.
 
 Nuance retained: at B=1 the MFMA path (117) is *slower* than the tuned LDG GEMV
 (221) — M=1 padded to 16 wastes 15/16 of each tile; LDG stays the batch-1
@@ -133,7 +139,7 @@ latency kernel, MFMA is the (still-uncompetitive) throughput path.
 | PyTorch HF (eager) | 57 | 1.0× |
 | MegaQwen (ported + grid-tuned) | 221 | 3.9× |
 | vLLM (ROCm) | 535 | 9.4× |
-| SGLang (ROCm) | TODO | — |
+| SGLang (ROCm) | 523 | 9.2× |
 
 The vLLM 535 here is an earlier decode-throughput reading (task #14); the fair
 end-to-end sweep above measures vLLM B=1 at 396 and per-seq peaking ~536 at B=2 —

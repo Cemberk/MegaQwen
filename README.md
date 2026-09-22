@@ -27,6 +27,7 @@ the CUDA→ROCm port notes are in [docs/MI300X_ROADMAP.md](docs/MI300X_ROADMAP.m
 |---------|---------------|---------------|
 | **MegaQwen (this fork)** | **221** | **3.9×** |
 | vLLM (ROCm) | 535 | 9.4× |
+| SGLang (ROCm) | 523 | 9.2× |
 | HuggingFace (eager) | 57 | 1.0× |
 
 **Batched total throughput** — the XCD-aware megakernel with a **batch-adaptive
